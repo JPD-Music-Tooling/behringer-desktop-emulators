@@ -178,6 +178,9 @@ def run(args):
         say(f"wrote a silent SoundFont to {SOUNDFONT} (the app needs one to start)")
     os.makedirs(RUN, exist_ok=True)
     ctl, plog, alog, sock = (os.path.join(RUN, n) for n in ("panel.ctl", "panel.log", "ignite.log", "screen.sock"))
+    if len(sock.encode()) > 100:  # a unix socket path has room for about 104 bytes: use a short one
+        import hashlib
+        sock = f"/tmp/ignitem-{os.getuid()}-{hashlib.sha1(RUN.encode()).hexdigest()[:8]}.sock"
     for f in (ctl, plog, alog, ctl + ".seq", ctl + ".reply", sock):
         if os.path.exists(f):
             os.remove(f)
