@@ -1,0 +1,146 @@
+From christian-schneider's desktop-fixes branch (MusicTribeOpenSource/0716-AAF PR #8), the parts
+this emulator needs: a macOS CHardwareTimer so the sequencer clock ticks (Play works), and the
+non-throwing fs::space on macOS (the storage page aborted the app). _running is set before the
+timer thread starts. The PR's idle-loop changes are covered by 0001; its JUCE text-input patch is
+not needed with the headless screen of 0002.
+
+diff --git a/Source/Application/modules/Common/Board/CHardwareTimer.h b/Source/Application/modules/Common/Board/CHardwareTimer.h
+index dd5c26c1..62ec091d 100644
+--- a/Source/Application/modules/Common/Board/CHardwareTimer.h
++++ b/Source/Application/modules/Common/Board/CHardwareTimer.h
+@@ -37,6 +37,11 @@ namespace Ignite
+ #ifdef _WIN32
+             std::thread _thread;
+ 			void hiResTimerThread(void);
++#endif
++#ifdef __APPLE__
++            std::thread _thread;
++            void posixTimerThread(void);
++            std::chrono::steady_clock::time_point _nextExpiry;
+ #endif
+             uint32_t _intervalus = 0;
+             HardwareTimerCb _callback;
+diff --git a/Source/Application/modules/Common/Board/Simulator/CHardwareTimer.cpp b/Source/Application/modules/Common/Board/Simulator/CHardwareTimer.cpp
+index 536d6221..1d8788e0 100644
+--- a/Source/Application/modules/Common/Board/Simulator/CHardwareTimer.cpp
++++ b/Source/Application/modules/Common/Board/Simulator/CHardwareTimer.cpp
+@@ -1,5 +1,13 @@
+ #include "../Board/CHardwareTimer.h"
+ 
++#ifdef __APPLE__
++#include <pthread.h>
++#include <sched.h>
++#include <cerrno>
++#include <cstring>
++#include <iostream>
++#endif
++
+ #ifdef __linux__
+ #include <climits>
+ #define SEC_TO_NSEC_SCALER 1000000000
+@@ -88,6 +96,17 @@ bool CHardwareTimer::start(const uint16_t intervalus)
+     // Create and start the timer thread
+     _thread = std::thread(&CHardwareTimer::hiResTimerThread, this);
+     _thread.detach();
++#elif defined __APPLE__
++    _nextExpiry = std::chrono::steady_clock::now() + std::chrono::microseconds(_intervalus);
++    if (_running)
++    {
++        _activeCB = true; // thread keeps running, just re-arm the callback
++        return true;
++    }
++    _running = true; // before the thread starts: it runs while _running is set
++    _activeCB = true;
++    _thread = std::thread(&CHardwareTimer::posixTimerThread, this);
++    _thread.detach();
+ #endif
+      _running = true;
+     _activeCB = true;
+@@ -132,6 +151,8 @@ bool CHardwareTimer::changeInterval(const uint16_t intervalus)
+         DBG("_intervalus :" + String(_intervalus));
+         //printf ("Change : Next expiry %llu : %llu\n", _timepoint.tv_sec, _timepoint.tv_nsec);
+         //std::cout << _intervalus << std::endl;;
++#elif defined __APPLE__
++        _nextExpiry = std::chrono::steady_clock::now() + std::chrono::microseconds(_intervalus);
+ #endif
+     }
+     return true;
+@@ -250,3 +271,48 @@ void CHardwareTimer::hiResTimerThread(void)
+ }
+ 
+ #endif /* _WIN32 */
++
++#ifdef __APPLE__
++// macOS has neither the Linux SCHED_FIFO loop nor the Windows QueryPerformanceCounter
++// thread above, so without this the sequencer clock never ticked on desktop Macs.
++// A steady_clock thread sleeps until shortly before the next tick, then spins.
++// (From christian-schneider's desktop-fixes, MusicTribeOpenSource/0716-AAF PR #8.)
++void CHardwareTimer::posixTimerThread(void)
++{
++    using namespace std::chrono;
++
++    // Ask for a high scheduling priority; failure only loosens the timing.
++    sched_param param {};
++    const int policy = SCHED_RR;
++    param.sched_priority = sched_get_priority_max(policy);
++    if (pthread_setschedparam(pthread_self(), policy, &param) != 0)
++        std::cerr << "CHardwareTimer: pthread_setschedparam failed: " << strerror(errno) << std::endl;
++
++    while (_running)
++    {
++        if (!_activeCB)
++        {
++            std::this_thread::sleep_for(milliseconds(1));
++            continue;
++        }
++
++        const auto now = steady_clock::now();
++        if (now >= _nextExpiry)
++        {
++            _nextExpiry += microseconds(_intervalus);
++            if (_nextExpiry < now) // fell far behind (e.g. after system sleep): resync instead of bursting
++                _nextExpiry = now + microseconds(_intervalus);
++            if (_callback)
++                _callback(_context);
++        }
++        else
++        {
++            const auto remaining = _nextExpiry - now;
++            if (remaining > microseconds(300))
++                std::this_thread::sleep_for(remaining - microseconds(200));
++            else
++                std::this_thread::yield();
++        }
++    }
++}
++#endif /* __APPLE__ */
+diff --git a/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp b/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp
+index 6f7328e0..a5ab6bf7 100644
+--- a/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp
++++ b/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp
+@@ -2658,8 +2658,11 @@ void FrontPannelManager::getIntStorageStatus()
+ {
+ #if defined FP_UART_LINUX
+ 	auto intStorage = fs::space("/data/ignite/");
+-#else
++#elif defined _WIN32
+ 	auto intStorage = fs::space("C:/");
++#else
++	std::error_code ec; // macOS/Linux desktop: root volume; non-throwing overload (the throwing one aborted the app)
++	auto intStorage = fs::space("/", ec);
+ #endif
+ 	intTotalSize = static_cast<int>((intStorage.capacity / (1024 * 1024)));
+ 	intFreeSize = static_cast<int>((intStorage.free / (1024 * 1024)));
+@@ -2694,8 +2697,11 @@ void FrontPannelManager::getUsbStorageStatus()
+ 	{
+ #if defined FP_UART_LINUX
+ 		auto usbStorage = fs::space("/mnt/flash/");
+-#else
++#elif defined _WIN32
+ 		auto usbStorage = fs::space("C:/");
++#else
++		std::error_code ec;
++		auto usbStorage = fs::space("/Volumes", ec);
+ #endif
+ 		usbTotalSize = static_cast<int>((usbStorage.capacity / (1024 * 1024)));
+ 		usbFreeSize = static_cast<int>((usbStorage.free / (1024 * 1024)));

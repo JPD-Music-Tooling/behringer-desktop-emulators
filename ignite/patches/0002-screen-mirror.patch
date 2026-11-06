@@ -53,10 +53,10 @@ index 69620642..9932ebc8 100644
  			// This is called when the user tries to close this window. Here, we'll just
 diff --git a/Source/Application/apps/ignite/ScreenMirror.cpp b/Source/Application/apps/ignite/ScreenMirror.cpp
 new file mode 100644
-index 00000000..fe0d86ce
+index 00000000..223a3c0a
 --- /dev/null
 +++ b/Source/Application/apps/ignite/ScreenMirror.cpp
-@@ -0,0 +1,773 @@
+@@ -0,0 +1,804 @@
 +/*
 + * Copyright (c) 2024 MUSIC Tribe
 + *
@@ -654,10 +654,13 @@ index 00000000..fe0d86ce
 +                server->onPointer = [onMessageThread]( int Mask, int X, int Y ) {
 +                    onMessageThread( [Mask, X, Y]( MirrorPeer& P ) { P.pointer( Mask, X, Y ); } );
 +                };
++                adopter.peer = this;
++                adopter.startTimer( 20 );
 +            }
 +
 +            ~MirrorPeer() override
 +            {
++                adopter.stopTimer();
 +                stopTimer();
 +                server.reset(); // stops its thread before the peer goes
 +            }
@@ -789,6 +792,34 @@ index 00000000..fe0d86ce
 +                                  juce::Time::currentTimeMillis() );
 +            }
 +
++            // Dialogs (juce::DialogWindow::launchAsync, alerts) are windows of their own on the
++            // unit's display, on top of the main one. Here only the main window is served, so any
++            // other window that appears is moved into it, centred, as a child: it is drawn on the
++            // served screen and gets the touches, and it stays modal (the rest of the window stays
++            // blocked until it closes, as on the unit). Its native window lives for at most one tick.
++            struct Adopter : juce::Timer
++            {
++                MirrorPeer* peer{ nullptr };
++                void        timerCallback() override
++                {
++                    auto& main = peer->getComponent();
++                    auto& desktop = juce::Desktop::getInstance();
++                    for( int i = desktop.getNumComponents(); --i >= 0; )
++                    {
++                        auto* c = desktop.getComponent( i );
++                        if( c == nullptr || c == &main || !c->isVisible() || dynamic_cast<juce::TopLevelWindow*>( c ) == nullptr )
++                            continue;
++                        const int w = juce::jmin( c->getWidth(), main.getWidth() ), h = juce::jmin( c->getHeight(), main.getHeight() );
++                        main.addChildComponent( c ); // takes it off the desktop
++                        c->setBounds( main.getLocalBounds().withSizeKeepingCentre( w, h ) );
++                        c->setVisible( true );
++                        c->toFront( true );
++                        mirrorLog( "showing " + describe( *c ) + " in the window" );
++                    }
++                }
++            };
++
++            Adopter                    adopter;
 +            std::unique_ptr<RfbServer> server;
 +            juce::Rectangle<int>       bounds;
 +            bool                       fullScreen{ false }, wasDown{ false };
@@ -902,3 +933,40 @@ index 00000000..beaa4a66
 +        static bool isMirrored( const juce::Component& C );
 +    };
 +} // namespace testcontrol
+diff --git a/Source/Application/modules/common_ui_controls/source/common_keyboard.cpp b/Source/Application/modules/common_ui_controls/source/common_keyboard.cpp
+index 83059a2c..339a9bdd 100644
+--- a/Source/Application/modules/common_ui_controls/source/common_keyboard.cpp
++++ b/Source/Application/modules/common_ui_controls/source/common_keyboard.cpp
+@@ -238,7 +238,8 @@ namespace ui
+ 
+ 	void CommonKeyPad::show(std::function<void(int)> CallbackOnExit)
+ 	{
+-		if (auto w = juce::TopLevelWindow::getActiveTopLevelWindow())
++		if (auto w = juce::TopLevelWindow::getActiveTopLevelWindow() ? juce::TopLevelWindow::getActiveTopLevelWindow()
++		             : juce::TopLevelWindow::getNumTopLevelWindows() > 0 ? juce::TopLevelWindow::getTopLevelWindow(0) : nullptr)
+ 			image = w->createComponentSnapshot(ui::Rectangle<int>{0, 0, 1024, 600}, true);
+ 		ui::blurImage<2>(image);
+ 		DialogWindow::LaunchOptions options;
+diff --git a/Source/Application/modules/common_ui_controls/source/common_utils.cpp b/Source/Application/modules/common_ui_controls/source/common_utils.cpp
+index a396d755..708fa4dd 100644
+--- a/Source/Application/modules/common_ui_controls/source/common_utils.cpp
++++ b/Source/Application/modules/common_ui_controls/source/common_utils.cpp
+@@ -132,7 +132,8 @@ namespace ui
+ 		{
+ 			image.clear(ui::layout::screen);
+ 			if(!showImage)
+-			if (auto w = juce::TopLevelWindow::getActiveTopLevelWindow())
++			if (auto w = juce::TopLevelWindow::getActiveTopLevelWindow() ? juce::TopLevelWindow::getActiveTopLevelWindow()
++			             : juce::TopLevelWindow::getNumTopLevelWindows() > 0 ? juce::TopLevelWindow::getTopLevelWindow(0) : nullptr)
+ 			{
+ 			
+ 				image =( w->createComponentSnapshot(ui::Rectangle<int>{0, 0, 1024, 600}, true));
+@@ -257,6 +258,8 @@ namespace ui
+ 		_dlgBoxes.emplace_back(new dialogDisplayer{ false, showResetBtn, "", nullptr, {}, juce::Colours::transparentBlack });
+ 		auto& p = _dlgBoxes.back();
+ 		auto  c = juce::TopLevelWindow::getActiveTopLevelWindow();
++		if (c == nullptr && juce::TopLevelWindow::getNumTopLevelWindows() > 0)
++			c = juce::TopLevelWindow::getTopLevelWindow(0); // no active window (an app in the background, a mirrored screen): the main one
+ 		c->addAndMakeVisible(p.get());
+ 		p->isInUse = true;
+ 		return p.get();

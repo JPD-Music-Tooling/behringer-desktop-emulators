@@ -93,16 +93,19 @@ The IGNITE's app runs on a Linux board and talks to a microcontroller that scans
   - `ignite/panel/Link.cpp` speaks the panel's side, over a pty.
 - **`ignite/patches/0001-desktop-front-panel-port.patch`** makes the app read its panel from the serial port or pty named by `IGNITE_FP_TTY` on macOS. It also stops two threads that otherwise spin with nothing to read, which kept the optimised build from running. With the variable unset it does nothing, and the device build is unchanged.
 - **`ignite/patches/0002-screen-mirror.patch`** adds a screen mirror, taken from the KICK firmware. With `IGNITE_SCREEN_MIRROR=<unix socket>`, the app renders its window headless and serves the screen as RFB ("VNC") on that socket, and pointer events come back as touches. `ignite/panel/ScreenView.cpp` shows it in the panel's display cut-out.
+  - The app's dialogs show on that screen too. The patch moves any window the app opens (`DialogWindow`, alerts) into the main window. Where the app asks for "the active window" to put its own overlays in, and gets none because the app runs in the background, it falls back to its only window, which is what the unit always has.
+- **`ignite/patches/0003-macos-sequencer-clock.patch`** makes Play work on macOS. The app's sequencer clock (`CHardwareTimer`) only had Linux and Windows versions, so on a Mac it never ticked. The macOS timer thread is christian-schneider's, from [PR #8 on 0716-AAF](https://github.com/MusicTribeOpenSource/0716-AAF/pull/8), with one change: it sets `_running` before the thread starts, so the thread can't find it unset and quit. From the same PR comes the non-throwing `fs::space` call, because the throwing one aborted the app on macOS.
 - **A sound font.** The app needs one (`/tmp/Ignite.sf2` on macOS), and the real one is not in Behringer's release, so `emu` writes a silent one if there is none.
 
 Verified against the app:
 - the handshake;
 - keys and their lights;
 - pad colours;
-- touch;
-- jog and ROW turns.
+- touch, including the app's dialogs;
+- jog and ROW turns;
+- Play. With a scene, and a track with a pattern and an output instrument, PLAY starts the sequencer: the PLAY and STOP keys light up and the playhead walks the pads. At 130 BPM it measured 460 ms a step, against 461.5 ms expected.
 
-Knobs A–H and the step encoders send the same message format; they act on the track pages. The sequencer does not play yet on macOS, because the app has no macOS clock. [PR #8 on 0716-AAF](https://github.com/MusicTribeOpenSource/0716-AAF/pull/8) adds one.
+Knobs A–H and the step encoders send the same message format; they act on the track pages.
 
 ### AQ64L and BCR32
 
