@@ -105,8 +105,9 @@ void Panel::paint(juce::Graphics& g) {
         g.setColour(kSilk);
         g.setFont(juce::Font(30.0f, juce::Font::bold));
         g.drawText("IGNITE", juce::Rectangle<float>(sc->x, sc->y + sc->h + 8, sc->w, 36), juce::Justification::centred);
-        g.setFont(juce::Font(24.0f, juce::Font::plain));
-        g.drawText("behringer", juce::Rectangle<float>(sc->x, sc->y - 42, sc->w, 34), juce::Justification::centred);
+        g.setFont(juce::Font(13.0f, juce::Font::plain));
+        g.setColour(kSilk.withAlpha(0.6f));
+        g.drawText("unofficial emulator", juce::Rectangle<float>(sc->x, sc->y - 30, sc->w, 20), juce::Justification::centred);
     }
     g.setColour(kSilk);
     g.setFont(juce::Font(15.0f, juce::Font::bold));

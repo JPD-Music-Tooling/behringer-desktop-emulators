@@ -1,0 +1,92 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""emu_ctl: drive a running emulator (started with `emu run DEVICE`), for tests and screenshots.
+
+    emu_ctl [DEVICE] COMMAND [ARGS...]
+
+DEVICE (ignite, aq64l, bcr32) may be left out when one emulator is running. Commands every panel has:
+    press NAME [MS]   down NAME   up NAME   list   lit   shot OUT.png [SCALE]
+IGNITE:  turn NAME STEPS   screenshot OUT.png   touch X Y [X2 Y2 [MS]]   link
+AQ64L:   state   ports   power
+BCR32:   turn NAME DETENTS   oled [OUT.png]   cv   cable on|off   state   ports   power
+
+The runs are found in ~/.cache/behringer-desktop-emulators/run (or $EMU_CACHE/run, or $EMU_RUN_DIR
+naming one run's directory).
+"""
+import json, os, re, sys, time
+
+DEVICES = ("ignite", "aq64l", "bcr32")
+CACHE = os.environ.get("EMU_CACHE") or os.path.expanduser("~/.cache/behringer-desktop-emulators")
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def load(path):
+    try:
+        return json.load(open(os.path.join(path, "state.json")))
+    except OSError:
+        return None
+
+
+def find_run(args):
+    if os.environ.get("EMU_RUN_DIR"):
+        return load(os.environ["EMU_RUN_DIR"]), args
+    runs = {d: load(os.path.join(CACHE, "run", d)) for d in DEVICES}
+    runs = {d: st for d, st in runs.items() if st and alive(st.get("pid"))}
+    if args and args[0] in DEVICES:
+        return runs.get(args[0]), args[1:]
+    if len(runs) == 1:
+        return next(iter(runs.values())), args
+    if not runs:
+        return None, args
+    sys.exit(f"emu_ctl: {', '.join(runs)} are running: name one (emu_ctl DEVICE COMMAND ...)")
+
+
+def main():
+    args = sys.argv[1:]
+    if not args or args[0] in ("-h", "--help"):
+        print(__doc__)
+        return 2
+    st, args = find_run(args)
+    if not st:
+        print("emu_ctl: no run (start one with: emu run DEVICE)", file=sys.stderr)
+        return 1
+    if not args:
+        print("emu_ctl: no command", file=sys.stderr)
+        return 2
+    ctl, log = st["control"], st["panel_log"]
+    seqf = ctl + ".seq"
+    seq = int(open(seqf).read() or 0) + 1 if os.path.exists(seqf) else 1
+    open(seqf, "w").write(str(seq))
+    start = os.path.getsize(log) if os.path.exists(log) else 0
+    with open(ctl, "a") as f:
+        f.write(f"{seq} {' '.join(args)}\n")
+    pat = re.compile(rf"^PanelControl: (ok|error) {seq}\b ?(.*)$", re.M)
+    end = time.time() + float(os.environ.get("EMU_CTL_TIMEOUT", "15"))
+    while time.time() < end:
+        with open(log, errors="replace") as f:
+            f.seek(start)
+            m = pat.search(f.read())
+        if m:
+            if m.group(1) == "error":
+                print("emu_ctl: " + m.group(2), file=sys.stderr)
+                return 1
+            try:
+                out = open(ctl + ".reply").read()
+            except OSError:
+                out = ""
+            if out:
+                print(out, end="")
+            return 0
+        time.sleep(0.03)
+    print("emu_ctl: no answer", file=sys.stderr)
+    return 1
+
+
+sys.exit(main())

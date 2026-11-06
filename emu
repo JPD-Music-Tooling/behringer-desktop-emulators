@@ -1,0 +1,356 @@
+#!/usr/bin/env python3
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""emu: run Behringer's open-sourced controller firmware on the desktop.
+
+    emu run    DEVICE [--firmware URL|PATH] [--ref BRANCH] [--app PATH] [--detach]
+    emu build  DEVICE ...                 fetch what is missing and build, without running
+    emu fetch  DEVICE ...                 clone Behringer's source (and patch it, for the IGNITE)
+    emu stop   [DEVICE]                   stop one run, or all
+    emu status
+    emu midi   ARGS...                    tools/midiprobe: list | send PORT HEX.. | listen PORT S | ask PORT S HEX..
+
+DEVICE is one of:
+    ignite   the IGNITE sequencer (0716-AAF): Behringer's app, patched to talk to an emulated front panel
+    aq64l    the AQ64L pad controller (0715-AAX): the demo firmware compiled for the desktop
+    bcr32    the BCR32 controller (0715-AAW): the demo firmware compiled for the desktop
+
+Drive a run with tools/emu_ctl. Builds and runs are kept in ~/.cache/behringer-desktop-emulators
+(or $EMU_CACHE).
+"""
+import argparse, hashlib, json, os, re, signal, struct, subprocess, sys, time
+
+HERE = os.path.dirname(os.path.abspath(__file__))
+CACHE = os.environ.get("EMU_CACHE") or os.path.expanduser("~/.cache/behringer-desktop-emulators")
+RUNS = os.path.join(CACHE, "run")
+ENV_BUILD = dict(os.environ, MACOSX_DEPLOYMENT_TARGET="11.0")  # JUCE's juceaide needs it in the environment
+
+DEVICES = {
+    "ignite": {"repo": "https://github.com/MusicTribeOpenSource/0716-AAF.git", "dir": "0716-AAF", "patches": "ignite/patches",
+               "target": "ignite-panel", "bundle": "ignite/ignite-panel_artefacts/Release/IGNITE panel.app/Contents/MacOS/IGNITE panel"},
+    "aq64l": {"repo": "https://github.com/MusicTribeOpenSource/0715-AAX.git", "dir": "0715-AAX", "cmake": "AQ64L_SOURCE",
+              "target": "aq64l-emulator", "bundle": "aq64l/aq64l-emulator_artefacts/Release/AQ64L emulator.app/Contents/MacOS/AQ64L emulator"},
+    "bcr32": {"repo": "https://github.com/MusicTribeOpenSource/0715-AAW.git", "dir": "0715-AAW", "cmake": "BCR32_SOURCE",
+              "target": "bcr32-emulator", "bundle": "bcr32/bcr32-emulator_artefacts/Release/BCR32 emulator.app/Contents/MacOS/BCR32 emulator"},
+}
+SOUNDFONT = "/tmp/Ignite.sf2"  # where the macOS build of the IGNITE app looks (ModelParams.h, SOUND_FONT_FILE)
+
+
+def say(msg):
+    print("emu: " + msg, flush=True)
+
+
+def die(msg):
+    say(msg)
+    sys.exit(1)
+
+
+def sh(cmd, cwd=None, log=None):
+    with open(log, "a") if log else open(os.devnull, "w") as out:
+        r = subprocess.run(cmd, cwd=cwd, stdout=out, stderr=subprocess.STDOUT, env=ENV_BUILD)
+    if r.returncode:
+        die(f"failed: {' '.join(cmd)}" + (f" (see {log})" if log else ""))
+
+
+def build_log():
+    os.makedirs(os.path.join(CACHE, "logs"), exist_ok=True)
+    return os.path.join(CACHE, "logs", "build.log")
+
+
+# ---- sources
+
+def source_dir(dev, args=None):
+    fw = getattr(args, "firmware", None)
+    if fw and os.path.isdir(fw):
+        return os.path.abspath(fw)
+    return os.path.join(CACHE, "firmware", DEVICES[dev]["dir"])
+
+
+def fetch_one(dev, args=None):
+    d = DEVICES[dev]
+    src = source_dir(dev, args)
+    if not os.path.isdir(src):
+        url = getattr(args, "firmware", None) or d["repo"]
+        ref = getattr(args, "ref", None) or "main"
+        os.makedirs(os.path.dirname(src), exist_ok=True)
+        say(f"fetching {url} ({ref})")
+        sh(["git", "clone", "--depth", "1", "--branch", ref, url, src])
+    if "patches" in d:
+        pdir = os.path.join(HERE, d["patches"])
+        for p in sorted(os.listdir(pdir)):
+            path = os.path.join(pdir, p)
+            if subprocess.run(["git", "apply", "--reverse", "--check", path], cwd=src, capture_output=True).returncode == 0:
+                continue  # already applied
+            if subprocess.run(["git", "apply", "--check", path], cwd=src, capture_output=True).returncode:
+                die(f"patch {p} does not apply to {src}")
+            sh(["git", "apply", path], cwd=src)
+            say(f"applied {p}")
+    return src
+
+
+# ---- building
+
+def panels_dir():
+    return os.path.join(CACHE, "build", "panels")
+
+
+def binary(dev):
+    return os.path.join(panels_dir(), DEVICES[dev]["bundle"])
+
+
+def ignite_app():
+    return os.path.join(CACHE, "build", "ignite-app", "apps", "ignite", "Ignite_artefacts", "Release", "Ignite.app", "Contents", "MacOS", "Ignite")
+
+
+def midiprobe():
+    return os.path.join(panels_dir(), "tools", "midiprobe", "midiprobe_artefacts", "Release", "midiprobe")
+
+
+def build_panels(devs, args=None):
+    """One CMake build for the panels and tools; the firmware of the AQ64L and BCR32 is compiled into theirs."""
+    log = build_log()
+    cfg = ["cmake", "-S", HERE, "-B", panels_dir(), "-DCMAKE_BUILD_TYPE=Release", "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0"]
+    if os.environ.get("EMU_JUCE"):
+        cfg.append("-DFETCHCONTENT_SOURCE_DIR_JUCE=" + os.environ["EMU_JUCE"])
+    for dev, d in DEVICES.items():
+        if "cmake" in d:
+            src = source_dir(dev, args if dev in devs else None)
+            if os.path.isdir(src):
+                cfg.append(f"-D{d['cmake']}={src}")
+    say("building " + ", ".join(DEVICES[d]["target"] for d in devs))
+    sh(cfg, log=log)
+    sh(["cmake", "--build", panels_dir(), "--config", "Release", "-j", str(os.cpu_count() or 4), "--target", "midiprobe"] +
+       [DEVICES[d]["target"] for d in devs], log=log)
+
+
+def build(args):
+    devs = args.devices
+    for dev in devs:
+        fetch_one(dev, args)
+    if "ignite" in devs and not getattr(args, "app", None):
+        say("building the IGNITE app (the first time takes a while)")
+        b = os.path.join(CACHE, "build", "ignite-app")
+        log = build_log()
+        sh(["cmake", "-S", os.path.join(source_dir("ignite", args), "Source", "Application"), "-B", b, "-DCMAKE_BUILD_TYPE=Release",
+            "-DCMAKE_OSX_DEPLOYMENT_TARGET=11.0", "-DCMAKE_POLICY_VERSION_MINIMUM=3.5"], log=log)
+        sh(["cmake", "--build", b, "--config", "Release", "--target", "Ignite", "-j", str(os.cpu_count() or 4)], log=log)
+    build_panels(devs, args)
+
+
+def fetch(args):
+    for dev in args.devices:
+        fetch_one(dev, args)
+
+
+# ---- running
+
+def run_dir(dev):
+    return os.path.join(RUNS, dev)
+
+
+def state(dev):
+    try:
+        return json.load(open(os.path.join(run_dir(dev), "state.json")))
+    except OSError:
+        return None
+
+
+def alive(pid):
+    try:
+        os.kill(pid, 0)
+        return True
+    except (OSError, TypeError):
+        return False
+
+
+def running(dev):
+    st = state(dev)
+    return st if st and any(alive(st.get(k)) for k in ("pid", "app_pid")) else None
+
+
+def wait_for(path, pattern, seconds, proc=None):
+    rx = re.compile(pattern)
+    end = time.time() + seconds
+    while time.time() < end:
+        if os.path.exists(path):
+            m = rx.search(open(path, errors="replace").read())
+            if m:
+                return m
+        if proc and proc.poll() is not None:
+            return None
+        time.sleep(0.1)
+    return None
+
+
+def stop_one(dev):
+    st = state(dev)
+    if not st:
+        return False
+    pids = [st.get(k) for k in ("app_pid", "pid") if st.get(k)]
+    for p in pids:
+        if alive(p):
+            os.kill(p, signal.SIGTERM)
+    end = time.time() + 3
+    while time.time() < end and any(alive(p) for p in pids):
+        time.sleep(0.1)
+    for p in pids:
+        if alive(p):
+            os.kill(p, signal.SIGKILL)
+    os.remove(os.path.join(run_dir(dev), "state.json"))
+    say(f"stopped {dev}")
+    return True
+
+
+def stop(args):
+    devs = [args.device] if args.device else list(DEVICES)
+    if not any([stop_one(d) for d in devs]):
+        say("nothing is running")
+
+
+def fresh_run_files(dev, names):
+    d = run_dir(dev)
+    os.makedirs(d, exist_ok=True)
+    paths = [os.path.join(d, n) for n in names]
+    for f in paths + [p + s for p in paths for s in (".seq", ".reply")]:
+        if os.path.exists(f):
+            os.remove(f)
+    return paths
+
+
+def silent_soundfont(path):
+    """A minimal valid SoundFont 2 with one silent sample: the IGNITE app needs one to start, and the real one
+    (Ignite.sf2) is not part of Behringer's release."""
+    def chunk(tag, data):
+        if len(data) % 2:
+            data += b"\0"
+        return tag + struct.pack("<I", len(data)) + data
+    def lst(tag, *chunks):
+        body = tag + b"".join(chunks)
+        return b"LIST" + struct.pack("<I", len(body)) + body
+    def name20(s):
+        return s.encode()[:19].ljust(20, b"\0")
+    n = 200
+    info = lst(b"INFO", chunk(b"ifil", struct.pack("<HH", 2, 1)), chunk(b"isng", b"EMU8000\0"), chunk(b"INAM", b"Silent\0"))
+    sdta = lst(b"sdta", chunk(b"smpl", b"\0\0" * (n + 46)))
+    phdr = name20("Silent") + struct.pack("<HHHIII", 0, 0, 0, 0, 0, 0) + name20("EOP") + struct.pack("<HHHIII", 0, 0, 1, 0, 0, 0)
+    bag = struct.pack("<HH", 0, 0) + struct.pack("<HH", 1, 0)
+    pgen = struct.pack("<HH", 41, 0) + struct.pack("<HH", 0, 0)
+    inst = name20("Silent") + struct.pack("<H", 0) + name20("EOI") + struct.pack("<H", 1)
+    igen = struct.pack("<HH", 53, 0) + struct.pack("<HH", 0, 0)
+    shdr = name20("Silence") + struct.pack("<IIIIIBbHH", 0, n, 10, n - 10, 22050, 60, 0, 0, 1) + name20("EOS") + b"\0" * 26
+    pdta = lst(b"pdta", chunk(b"phdr", phdr), chunk(b"pbag", bag), chunk(b"pmod", b"\0" * 10), chunk(b"pgen", pgen),
+               chunk(b"inst", inst), chunk(b"ibag", bag), chunk(b"imod", b"\0" * 10), chunk(b"igen", igen), chunk(b"shdr", shdr))
+    body = b"sfbk" + info + sdta + pdta
+    with open(path, "wb") as f:
+        f.write(b"RIFF" + struct.pack("<I", len(body)) + body)
+
+
+def run_ignite(args):
+    app = os.path.abspath(args.app) if args.app else ignite_app()
+    if args.app and not os.path.isfile(app):
+        die(f"no IGNITE app at {app}")
+    if not os.path.exists(app) or not os.path.exists(binary("ignite")):
+        build(argparse.Namespace(**{**vars(args), "devices": ["ignite"]}))
+    if not os.path.exists(SOUNDFONT):
+        silent_soundfont(SOUNDFONT)
+        say(f"wrote a silent SoundFont to {SOUNDFONT} (the app needs one to start)")
+    ctl, plog, alog, sock = fresh_run_files("ignite", ["panel.ctl", "panel.log", "ignite.log", "screen.sock"])
+    if len(sock.encode()) > 100:  # a unix socket path has room for about 104 bytes: use a short one
+        sock = f"/tmp/emu-{os.getuid()}-{hashlib.sha1(RUNS.encode()).hexdigest()[:8]}.sock"
+        if os.path.exists(sock):
+            os.remove(sock)
+    open(ctl, "w").close()
+    panel = subprocess.Popen([binary("ignite"), "--control", ctl, "--screen", "unix:" + sock], stdout=open(plog, "w"),
+                             stderr=subprocess.STDOUT, start_new_session=True)
+    m = wait_for(plog, r"IgnitePanel: listening on (\S+)", 15, panel)
+    if not m:
+        die(f"the panel did not start (see {plog})")
+    tty = m.group(1)
+    say(f"panel on {tty}")
+    proc = subprocess.Popen([app], cwd=os.path.dirname(app), env=dict(os.environ, IGNITE_FP_TTY=tty, IGNITE_SCREEN_MIRROR=sock),
+                            stdout=open(alog, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    json.dump({"device": "ignite", "pid": panel.pid, "app_pid": proc.pid, "tty": tty, "control": ctl, "panel_log": plog, "app_log": alog,
+               "screen": sock, "app": app, "started": time.time()}, open(os.path.join(run_dir("ignite"), "state.json"), "w"), indent=1)
+    if not wait_for(plog, r"IgnitePanel: LIVE", 30, proc):
+        say(f"no handshake yet (see {plog} and {alog})")
+    else:
+        say("LIVE: the app and the panel are talking")
+    return [panel, proc]
+
+
+def run_firmware(dev, args):
+    if not os.path.exists(binary(dev)):
+        build(argparse.Namespace(**{**vars(args), "devices": [dev]}))
+    ctl, log = fresh_run_files(dev, ["panel.ctl", "panel.log"])
+    open(ctl, "w").close()
+    proc = subprocess.Popen([binary(dev), "--control", ctl], stdout=open(log, "w"), stderr=subprocess.STDOUT, start_new_session=True)
+    json.dump({"device": dev, "pid": proc.pid, "control": ctl, "panel_log": log, "started": time.time()},
+              open(os.path.join(run_dir(dev), "state.json"), "w"), indent=1)
+    if not wait_for(log, r"firmware running", 15, proc):
+        die(f"{dev} did not start (see {log})")
+    for line in open(log, errors="replace"):
+        if "port" in line:
+            say(line.split(": ", 1)[-1].strip())
+    say(f"{dev} running")
+    return [proc]
+
+
+def run(args):
+    dev = args.device
+    if running(dev):
+        die(f"{dev} is running: emu stop {dev} first")
+    procs = run_ignite(args) if dev == "ignite" else run_firmware(dev, args)
+    if args.detach:
+        return
+    say("running; Ctrl-C stops it")
+    try:
+        while all(p.poll() is None for p in procs):
+            time.sleep(0.5)
+    except KeyboardInterrupt:
+        pass
+    stop_one(dev)
+
+
+def status(_args):
+    any_ = False
+    for dev in DEVICES:
+        st = state(dev)
+        if not st:
+            continue
+        any_ = True
+        procs = " ".join(f"{k}={st[k]}({'running' if alive(st[k]) else 'gone'})" for k in ("pid", "app_pid") if k in st)
+        print(f"{dev:7} {procs}  log {st['panel_log']}")
+    if not any_:
+        say("nothing is running")
+
+
+def midi(args):
+    if not os.path.exists(midiprobe()):
+        build_panels([d for d in DEVICES if os.path.isdir(source_dir(d))] or [])
+    os.execv(midiprobe(), [midiprobe()] + args.rest)
+
+
+def main():
+    p = argparse.ArgumentParser(description="Run Behringer's open-sourced controller firmware on the desktop.")
+    sub = p.add_subparsers(dest="cmd", required=True)
+    for name in ("fetch", "build", "run"):
+        s = sub.add_parser(name)
+        if name == "run":
+            s.add_argument("device", choices=list(DEVICES))
+        else:
+            s.add_argument("devices", nargs="+", choices=list(DEVICES))
+        s.add_argument("--firmware", help="a git URL or a local checkout of Behringer's source (default: MusicTribeOpenSource)")
+        s.add_argument("--ref", default="main")
+        s.add_argument("--app", help="ignite: use this IGNITE app binary instead of building one")
+        if name == "run":
+            s.add_argument("--detach", action="store_true", help="leave it running and return")
+    s = sub.add_parser("stop")
+    s.add_argument("device", nargs="?", choices=list(DEVICES))
+    sub.add_parser("status")
+    s = sub.add_parser("midi")
+    s.add_argument("rest", nargs=argparse.REMAINDER)
+    a = p.parse_args()
+    {"fetch": fetch, "build": build, "run": run, "stop": stop, "status": status, "midi": midi}[a.cmd](a)
+
+
+if __name__ == "__main__":
+    main()
