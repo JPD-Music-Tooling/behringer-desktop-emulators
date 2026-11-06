@@ -1,0 +1,148 @@
+diff --git a/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp b/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp
+index f8e04b97..6f7328e0 100644
+--- a/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp
++++ b/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.cpp
+@@ -39,6 +39,19 @@ struct sockaddr_in server_addr;
+ #endif //FP_UART_LINUX
+ 
+ 
++#if defined FP_UART_POSIX
++// IGNITE emulator (desktop): the front panel is a serial port or a pty, named by IGNITE_FP_TTY
++#include <sys/types.h>
++#include <sys/stat.h>
++#include <fcntl.h>
++#include <termios.h>
++#include <unistd.h>
++#include <cstring>
++#include <cstdlib>
++#define BAUDRATE B115200
++static const char* fpDesktopDevice() { return std::getenv("IGNITE_FP_TTY"); }
++#endif //FP_UART_POSIX
++
+ #if defined FP_UART_LINUX
+ #define BAUDRATE B115200
+ #define MODEMDEVICE "/dev/ttymxc0"
+@@ -689,18 +702,26 @@ Module("FrontPannelManager", (moduleId_t)ModuleName::moduleFrontPannel, (unsigne
+ 	}
+ #endif // FP_WIN_ETHERNET_CLIENT
+ 
+-#if defined FP_UART_LINUX
++#if defined FP_UART_LINUX || defined FP_UART_POSIX
++#if defined FP_UART_POSIX
++	if (fpDesktopDevice() != nullptr)
++#endif
+ 	{
+ 		int c, res;
+ 		struct termios ttyMcu;
+ 
++#if defined FP_UART_POSIX
++		ttyMcuFileHandler = open(fpDesktopDevice(), O_RDWR | O_NOCTTY);
++		std::cout << "FP: front panel on " << fpDesktopDevice() << (ttyMcuFileHandler < 0 ? " (open failed)" : "") << std::endl;
++#else
+ 		ttyMcuFileHandler = open(MODEMDEVICE, O_RDWR | O_NOCTTY);
++#endif
+ 		if (ttyMcuFileHandler < 0)
+ 		{
+ 			//TODO: reset MCU  OR reset imx tty
+ 			DBG("MCU - ttymxc0: setup failed ---!");
+ 		}
+-		bzero(&ttyMcu, sizeof(ttyMcu));
++		memset(&ttyMcu, 0, sizeof(ttyMcu));
+ 
+ 		//cc_flag
+ 		ttyMcu.c_cflag = (BAUDRATE | CLOCAL | CREAD);
+@@ -745,7 +766,7 @@ Module("FrontPannelManager", (moduleId_t)ModuleName::moduleFrontPannel, (unsigne
+ #endif //FP_SIM_LINUX_REMOTE_SERVER
+ 		DBG("MCU - ttymxc0: setup done");
+ 	}
+-#endif// FP_UART_LINUX
++#endif// FP_UART_LINUX || FP_UART_POSIX
+ }
+ 
+ #if defined FP_SIM_LINUX_REMOTE_SERVER
+@@ -891,7 +912,12 @@ void FrontPannelManager::run()
+ 			continue;
+ 		}
+ 		if (DataToProcess < 4)
++		{
++#if defined FP_UART_POSIX
++			std::this_thread::sleep_for(std::chrono::milliseconds(1));  // desktop: wait instead of spinning
++#endif
+ 			continue;
++		}
+ 
+ 		SysMessage _sysMessage;
+ 		_sysMessage.Direction = DIRECTION_IN;
+@@ -1228,6 +1254,11 @@ void FrontPannelManager::FrontPannelExternalReadThreadFunction(void)
+ 		bool isDataFromEth = false;
+ #if defined FP_UART_LINUX
+ 		dwBytesRead = read(ttyMcuFileHandler, szBuff, bufferSize);
++#elif defined FP_UART_POSIX
++		if (ttyMcuFileHandler < 0)
++			std::this_thread::sleep_for(std::chrono::milliseconds(100));  // no panel: wait instead of spinning
++		else
++			dwBytesRead = static_cast<int>(read(ttyMcuFileHandler, szBuff, bufferSize));
+ #endif
+ #if defined FP_REMOTE_CLIENT_RECIVE || defined FP_REMOTE_CLIENT_RECIVE_WIN
+ 		if (dwBytesRead <= 0)
+@@ -1356,7 +1387,8 @@ void FrontPannelManager::FrontPannelExternalReadThreadFunction(void)
+ }
+ inline int FrontPannelManager::uart_write_with_retry(int ttyMcuFileHandler, const void* data, size_t size)
+ {
+-#if defined FP_UART_LINUX
++#if defined FP_UART_LINUX || defined FP_UART_POSIX
++	if (ttyMcuFileHandler < 0) return -1;
+ 	int retries = 0;
+ 	ssize_t bytes_written;
+ 
+@@ -1406,7 +1438,7 @@ void FrontPannelManager::FrontPannelExternalWriteThreadFunction(void)
+ 			case SYS_LED_MSG:
+ 			case SYS_KNOB_MSG:
+ 			case SYS_SYTM_MSG:
+-#if defined FP_UART_LINUX
++#if defined FP_UART_LINUX || defined FP_UART_POSIX
+ 				uart_write_with_retry(ttyMcuFileHandler, &fpQData.Header, 1);
+ 				uart_write_with_retry(ttyMcuFileHandler, &fpQData.Direction, 1);
+ 				uart_write_with_retry(ttyMcuFileHandler, &fpQData.Id, 1);
+@@ -1429,7 +1461,7 @@ void FrontPannelManager::FrontPannelExternalWriteThreadFunction(void)
+ 					break;
+ 
+ 			case SYS_SYNC_MSG:
+-#if defined FP_UART_LINUX
++#if defined FP_UART_LINUX || defined FP_UART_POSIX
+ 				uart_write_with_retry(ttyMcuFileHandler, &fpQData.Header, 1);
+ 				uart_write_with_retry(ttyMcuFileHandler, &fpQData.Direction, 1);
+ 				uart_write_with_retry(ttyMcuFileHandler, &fpQData.Id, 1);
+@@ -1561,7 +1593,7 @@ void FrontPannelManager::sendMidiMessageExternal(MidiMessage msg, uint8_t midipo
+ {
+ 	midiSendDone = false;
+ 	std::lock_guard<std::mutex> lock(midiSendMutx);//lock the FrontPanneExternalWriteQ - not to send any data to MCU
+-#if defined FP_UART_LINUX
++#if defined FP_UART_LINUX || defined FP_UART_POSIX
+ 	uint8_t header = SYS_MIDI_MSG;
+ 	uint8_t direction = DIRECTION_OUT;
+ 	uint8_t id = midiport;
+diff --git a/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.h b/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.h
+index e7dac854..5b19d3de 100644
+--- a/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.h
++++ b/Source/Application/modules/Firmware/Application/Model/FrontPannelManager.h
+@@ -25,7 +25,7 @@
+ //#define FP_TEST_KEYBRD              // uncomment Enable/Disable Key Test code
+ //#define FP_REMOTE_CLIENT_RECIVE_WIN // Recive from script or device based on IP
+ #elif __APPLE__
+-//
++#define FP_UART_POSIX // IGNITE emulator: the front panel over a serial port or pty named by IGNITE_FP_TTY (inert when it is not set)
+ #else //linux --- Remote Controll/Debug
+ //#define FP_SIM_LINUX_REMOTE_SERVER // This config Device as server, This must be enabled to use below
+ //#define FP_SIM_LINUX_REMOTE_SEND	 // Device will send the MCU inputs to connected client - MCU means Front pannel + MIDI
+@@ -377,8 +377,8 @@ namespace Ignite
+  293  , 292  , 290  , 289  , 288  , 287  , 286  , 285  , 283  , 282  , 281  , 280  , 279  , 278  , 276  , 276  , 275  , 274  , 273  , 271  ,
+  270  , 269  , 268  , 268  , 267  , 266  , 264  , 263  , 262  , 262  , 261  , 260  , 258  , 257  , 257  , 256  , 255  , 254  , 253  , 252  ,
+  251  , 251  , 250  , 249  , 248  , 247  , 246  , 245 };
+-#if defined FP_UART_LINUX
+-		int ttyMcuFileHandler;
++#if defined FP_UART_LINUX || defined FP_UART_POSIX
++		int ttyMcuFileHandler = -1;
+ 		int ttyUSBHostPortHandler;
+ 		std::chrono::steady_clock::time_point lastKeyPress;
+ 		std::atomic<bool> isScheduled;

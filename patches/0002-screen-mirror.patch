@@ -1,0 +1,904 @@
+diff --git a/Source/Application/apps/ignite/CMakeLists.txt b/Source/Application/apps/ignite/CMakeLists.txt
+index ad105ebe..63a26a35 100644
+--- a/Source/Application/apps/ignite/CMakeLists.txt
++++ b/Source/Application/apps/ignite/CMakeLists.txt
+@@ -68,6 +68,7 @@ target_include_directories(${TargetName}
+ target_sources(${TargetName} 
+     PRIVATE
+         Main.cpp
++        ScreenMirror.cpp
+ )
+ 
+ target_compile_definitions(${TargetName} 
+diff --git a/Source/Application/apps/ignite/Main.cpp b/Source/Application/apps/ignite/Main.cpp
+index 69620642..9932ebc8 100644
+--- a/Source/Application/apps/ignite/Main.cpp
++++ b/Source/Application/apps/ignite/Main.cpp
+@@ -25,6 +25,7 @@
+    ==============================================================================
+  */
+ #include <JuceHeader.h>
++#include "ScreenMirror.h"  // IGNITE emulator: IGNITE_SCREEN_MIRROR (inert when not set)
+ 
+ using namespace Ignite;
+ using namespace Ignite::Midi;
+@@ -155,8 +156,12 @@ public:
+ 		MainWindow(juce::String name)
+ 			: DocumentWindow(name,
+ 				juce::Desktop::getInstance().getDefaultLookAndFeel().findColour(juce::ResizableWindow::backgroundColourId),
+-				DocumentWindow::allButtons)
++				DocumentWindow::allButtons, !testcontrol::ScreenMirror::requested())
+ 		{
++			// IGNITE emulator: with IGNITE_SCREEN_MIRROR the window goes on the desktop here, so that
++			// createNewPeer below is ours; without it the base class has already added it, as before.
++			if (!isOnDesktop())
++				addToDesktop();
+ 			setContentOwned(&ui::getAppHome(), true);
+ 			setUsingNativeTitleBar(false);
+ 			setTitleBarHeight(0);
+@@ -168,6 +173,14 @@ public:
+ 			setVisible(true);
+ 		}
+ 
++		juce::ComponentPeer* createNewPeer(int styleFlags, void* nativeWindow) override
++		{
++			// IGNITE emulator: a headless peer serving the screen over IGNITE_SCREEN_MIRROR, if set
++			if (auto* mirror = testcontrol::ScreenMirror::createPeer(*this, styleFlags))
++				return mirror;
++			return juce::DocumentWindow::createNewPeer(styleFlags, nativeWindow);
++		}
++
+ 		void closeButtonPressed() override
+ 		{
+ 			// This is called when the user tries to close this window. Here, we'll just
+diff --git a/Source/Application/apps/ignite/ScreenMirror.cpp b/Source/Application/apps/ignite/ScreenMirror.cpp
+new file mode 100644
+index 00000000..fe0d86ce
+--- /dev/null
++++ b/Source/Application/apps/ignite/ScreenMirror.cpp
+@@ -0,0 +1,773 @@
++/*
++ * Copyright (c) 2024 MUSIC Tribe
++ *
++ * This file is part of Kick.
++ *
++ * Kick is free software: you can redistribute it and/or modify it under the
++ * terms of the GNU Affero General Public License as published by the Free
++ * Software Foundation, either version 3 of the License, or (at your option)
++ * any later version.
++ *
++ * Kick is distributed in the hope that it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with Kick. If not, see <https://www.gnu.org/licenses/>.
++ *
++ * SPDX-License-Identifier: AGPL-3.0-or-later
++ */
++
++// Taken from the KICK firmware (KickEm-Tools/0700-AAM, Kick/modules/test_control) for the IGNITE emulator:
++// the variable is IGNITE_SCREEN_MIRROR here.
++#include "ScreenMirror.h"
++
++#if JUCE_WINDOWS
++
++namespace testcontrol
++{
++    bool ScreenMirror::requested()
++    {
++        static const bool r = juce::SystemStats::getEnvironmentVariable( "IGNITE_SCREEN_MIRROR", {} ).trim().isNotEmpty();
++        return r;
++    }
++    juce::ComponentPeer* ScreenMirror::createPeer( juce::Component&, int )
++    {
++        if( requested() )
++            juce::Logger::writeToLog( "ScreenMirror: not available on Windows (needs unix sockets); using a normal window" );
++        return nullptr;
++    }
++    bool ScreenMirror::isMirrored( const juce::Component& ) { return false; }
++} // namespace testcontrol
++
++#else
++
++    #include <atomic>
++    #include <cerrno>
++    #include <cstdlib>
++    #include <typeinfo>
++    #if defined( __GNUC__ ) || defined( __clang__ )
++        #include <cxxabi.h>
++    #endif
++    #include <cstring>
++    #include <mutex>
++    #include <vector>
++
++    #include <fcntl.h>
++    #include <poll.h>
++    #include <sys/socket.h>
++    #include <sys/stat.h>
++    #include <sys/un.h>
++    #include <unistd.h>
++
++namespace testcontrol
++{
++    namespace
++    {
++        void mirrorLog( const juce::String& S ) { juce::Logger::writeToLog( "ScreenMirror: " + S ); }
++
++        /// "PROGRAMS (ui::KickLabel)": a component's title or name, and its class.
++        juce::String describe( const juce::Component& C )
++        {
++            juce::String type( typeid( C ).name() );
++    #if defined( __GNUC__ ) || defined( __clang__ )
++            int  status = 0;
++            auto* name  = abi::__cxa_demangle( typeid( C ).name(), nullptr, nullptr, &status );
++            if( status == 0 && name != nullptr )
++                type = name;
++            std::free( name );
++    #endif
++            const auto title = C.getTitle().isNotEmpty() ? C.getTitle() : C.getName();
++            return title.isNotEmpty() ? title + " (" + type + ")" : type;
++        }
++
++        constexpr int maxFramesPerSecond = 30;
++
++        //==========================================================================================
++        // Socket helpers (blocking, with the timeouts set on the socket).
++        bool readAll( int Fd, void* Data, size_t Size )
++        {
++            auto* p = static_cast<std::uint8_t*>( Data );
++            while( Size > 0 )
++            {
++                const auto n = ::recv( Fd, p, Size, 0 );
++                if( n > 0 )
++                {
++                    p += n;
++                    Size -= (size_t)n;
++                }
++                else if( n < 0 && errno == EINTR )
++                    continue;
++                else
++                    return false;
++            }
++            return true;
++        }
++
++        bool writeAll( int Fd, const void* Data, size_t Size )
++        {
++            #ifdef MSG_NOSIGNAL
++            constexpr int sendFlags = MSG_NOSIGNAL;
++            #else
++            constexpr int sendFlags = 0; // macOS: SO_NOSIGPIPE on the socket
++            #endif
++            auto* p = static_cast<const std::uint8_t*>( Data );
++            while( Size > 0 )
++            {
++                const auto n = ::send( Fd, p, Size, sendFlags );
++                if( n > 0 )
++                {
++                    p += n;
++                    Size -= (size_t)n;
++                }
++                else if( n < 0 && errno == EINTR )
++                    continue;
++                else
++                    return false;
++            }
++            return true;
++        }
++
++        bool skip( int Fd, size_t Size )
++        {
++            std::uint8_t buf[256];
++            while( Size > 0 )
++            {
++                const auto n = std::min( Size, sizeof( buf ) );
++                if( !readAll( Fd, buf, n ) )
++                    return false;
++                Size -= n;
++            }
++            return true;
++        }
++
++        std::uint16_t u16( const std::uint8_t* P ) { return (std::uint16_t)( ( P[0] << 8 ) | P[1] ); }
++        std::uint32_t u32( const std::uint8_t* P ) { return ( (std::uint32_t)P[0] << 24 ) | ( (std::uint32_t)P[1] << 16 ) | ( (std::uint32_t)P[2] << 8 ) | P[3]; }
++        void          put16( std::vector<std::uint8_t>& B, int V )
++        {
++            B.push_back( (std::uint8_t)( V >> 8 ) );
++            B.push_back( (std::uint8_t)V );
++        }
++        void put32( std::vector<std::uint8_t>& B, std::uint32_t V )
++        {
++            for( int s = 24; s >= 0; s -= 8 )
++                B.push_back( (std::uint8_t)( V >> s ) );
++        }
++
++        //==========================================================================================
++        /// RFB pixel format (RFC 6143 7.4). The server's own: 32 bits, little-endian, R at bit 16,
++        /// G at 8, B at 0, which is a juce::PixelARGB in memory on little-endian machines.
++        struct PixelFormat
++        {
++            int  bitsPerPixel{ 32 }, depth{ 24 };
++            bool bigEndian{ false }, trueColour{ true };
++            int  redMax{ 255 }, greenMax{ 255 }, blueMax{ 255 };
++            int  redShift{ 16 }, greenShift{ 8 }, blueShift{ 0 };
++
++            bool isNative() const
++            {
++                return JUCE_LITTLE_ENDIAN && bitsPerPixel == 32 && !bigEndian && trueColour && redMax == 255 && greenMax == 255 && blueMax == 255
++                       && redShift == 16 && greenShift == 8 && blueShift == 0;
++            }
++            void write( std::vector<std::uint8_t>& B ) const
++            {
++                B.push_back( (std::uint8_t)bitsPerPixel );
++                B.push_back( (std::uint8_t)depth );
++                B.push_back( bigEndian ? 1 : 0 );
++                B.push_back( trueColour ? 1 : 0 );
++                put16( B, redMax );
++                put16( B, greenMax );
++                put16( B, blueMax );
++                B.push_back( (std::uint8_t)redShift );
++                B.push_back( (std::uint8_t)greenShift );
++                B.push_back( (std::uint8_t)blueShift );
++                B.push_back( 0 );
++                B.push_back( 0 );
++                B.push_back( 0 );
++            }
++            static PixelFormat read( const std::uint8_t* P )
++            {
++                PixelFormat f;
++                f.bitsPerPixel = P[0];
++                f.depth        = P[1];
++                f.bigEndian    = P[2] != 0;
++                f.trueColour   = P[3] != 0;
++                f.redMax       = u16( P + 4 );
++                f.greenMax     = u16( P + 6 );
++                f.blueMax      = u16( P + 8 );
++                f.redShift     = P[10];
++                f.greenShift   = P[11];
++                f.blueShift    = P[12];
++                return f;
++            }
++        };
++
++        //==========================================================================================
++        /// The RFB server: one thread, one viewer at a time. The frame is painted on the message
++        /// thread (MirrorPeer) and read here, both under `lock`.
++        class RfbServer : private juce::Thread
++        {
++        public:
++            explicit RfbServer( const juce::String& Path )
++                : juce::Thread( "ScreenMirror" ), path( Path )
++            {
++            }
++
++            ~RfbServer() override
++            {
++                signalThreadShouldExit();
++                wake();
++                stopThread( 3000 );
++                for( int fd : { listenFd, wakeFds[0], wakeFds[1] } )
++                    if( fd >= 0 )
++                        ::close( fd );
++                // Only our own socket file: a newer instance may have bound the same path since.
++                struct stat st{};
++                if( ::stat( path.toRawUTF8(), &st ) == 0 && st.st_ino == socketInode && S_ISSOCK( st.st_mode ) )
++                    ::unlink( path.toRawUTF8() );
++            }
++
++            bool open( juce::String& Error )
++            {
++                sockaddr_un addr{};
++                if( (size_t)path.getNumBytesAsUTF8() >= sizeof( addr.sun_path ) )
++                {
++                    Error = "the path is longer than " + juce::String( (int)sizeof( addr.sun_path ) - 1 ) + " bytes";
++                    return false;
++                }
++                if( ::pipe( wakeFds ) != 0 )
++                {
++                    Error = juce::String( "pipe: " ) + juce::String( std::strerror( errno ) );
++                    return false;
++                }
++                for( int fd : wakeFds )
++                    ::fcntl( fd, F_SETFL, ::fcntl( fd, F_GETFL ) | O_NONBLOCK );
++
++                listenFd = ::socket( AF_UNIX, SOCK_STREAM, 0 );
++                if( listenFd < 0 )
++                {
++                    Error = juce::String( "socket: " ) + juce::String( std::strerror( errno ) );
++                    return false;
++                }
++                addr.sun_family = AF_UNIX;
++                std::strncpy( addr.sun_path, path.toRawUTF8(), sizeof( addr.sun_path ) - 1 );
++                struct stat st{};
++                if( ::lstat( path.toRawUTF8(), &st ) == 0 )
++                {
++                    if( !S_ISSOCK( st.st_mode ) )
++                    {
++                        Error = "exists and is not a socket";
++                        return false;
++                    }
++                    ::unlink( path.toRawUTF8() ); // a stale socket from an earlier run
++                }
++                const auto oldMask = ::umask( 0077 ); // the socket file: owner only
++                const int  bound   = ::bind( listenFd, (sockaddr*)&addr, sizeof( addr ) );
++                ::umask( oldMask );
++                if( bound != 0 || ::listen( listenFd, 2 ) != 0 )
++                {
++                    Error = juce::String( "bind / listen: " ) + juce::String( std::strerror( errno ) );
++                    return false;
++                }
++                if( ::stat( path.toRawUTF8(), &st ) == 0 )
++                    socketInode = st.st_ino;
++                startThread();
++                return true;
++            }
++
++            /// Message thread: the frame changed in these areas.
++            void framePainted( const juce::RectangleList<int>& Areas )
++            {
++                {
++                    std::lock_guard<std::mutex> l( lock );
++                    unsent.add( Areas );
++                }
++                wake();
++            }
++
++            /// Message thread, under `lock`: the window's size changed. A viewer cannot follow
++            /// (no DesktopSize here), so it is dropped and reconnects with the new size.
++            void frameResized()
++            {
++                unsent.clear();
++                dropViewer = true;
++                wake();
++            }
++
++            std::mutex             lock; // frame, unsent
++            juce::Image            frame;
++            std::atomic<bool>      hasViewer{ false };
++            std::function<void()>  onViewer; // server thread: a viewer connected (repaint everything)
++            std::function<void( int, int, int )> onPointer; // server thread: button mask, x, y
++
++        private:
++            void wake()
++            {
++                if( wakeFds[1] >= 0 )
++                {
++                    const char c = 1;
++                    [[maybe_unused]] auto n = ::write( wakeFds[1], &c, 1 );
++                }
++            }
++
++            void drainWake()
++            {
++                char buf[64];
++                while( ::read( wakeFds[0], buf, sizeof( buf ) ) > 0 ) {}
++            }
++
++            void run() override
++            {
++                while( !threadShouldExit() )
++                {
++                    pollfd fds[2] = { { listenFd, POLLIN, 0 }, { wakeFds[0], POLLIN, 0 } };
++                    if( ::poll( fds, 2, 500 ) <= 0 )
++                        continue;
++                    if( fds[1].revents != 0 )
++                        drainWake();
++                    if( ( fds[0].revents & POLLIN ) == 0 )
++                        continue;
++                    const int fd = ::accept( listenFd, nullptr, nullptr );
++                    if( fd < 0 )
++                        continue;
++                    #ifdef SO_NOSIGPIPE
++                    int one = 1;
++                    ::setsockopt( fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof( one ) );
++                    #endif
++                    timeval tv{ 5, 0 };
++                    ::setsockopt( fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof( tv ) );
++                    ::setsockopt( fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof( tv ) );
++                    juce::String why;
++                    if( handshake( fd, why ) )
++                        serve( fd );
++                    else
++                        mirrorLog( "viewer refused: " + why );
++                    ::close( fd );
++                }
++            }
++
++            bool handshake( int Fd, juce::String& Why )
++            {
++                const char* version = "RFB 003.008\n";
++                char        theirs[13]{};
++                if( !writeAll( Fd, version, 12 ) || !readAll( Fd, theirs, 12 ) )
++                    return ( Why = "no protocol version" ), false;
++                const juce::String v( theirs, 12 );
++                if( !v.startsWith( "RFB 003." ) )
++                    return ( Why = "not an RFB viewer" ), false;
++                const int minor = v.substring( 8, 11 ).getIntValue();
++                if( minor >= 7 )
++                {
++                    const std::uint8_t types[2] = { 1, 1 }; // one type: None
++                    std::uint8_t       chosen   = 0;
++                    if( !writeAll( Fd, types, 2 ) || !readAll( Fd, &chosen, 1 ) || chosen != 1 )
++                        return ( Why = "security type not None" ), false;
++                    if( minor >= 8 )
++                    {
++                        const std::uint8_t okResult[4] = { 0, 0, 0, 0 };
++                        if( !writeAll( Fd, okResult, 4 ) )
++                            return ( Why = "write failed" ), false;
++                    }
++                }
++                else
++                {
++                    const std::uint8_t none[4] = { 0, 0, 0, 1 };
++                    if( !writeAll( Fd, none, 4 ) )
++                        return ( Why = "write failed" ), false;
++                }
++                std::uint8_t shared = 0;
++                if( !readAll( Fd, &shared, 1 ) )
++                    return ( Why = "no ClientInit" ), false;
++
++                std::vector<std::uint8_t> init;
++                {
++                    std::lock_guard<std::mutex> l( lock );
++                    if( !frame.isValid() )
++                        return ( Why = "the window has no size yet" ), false;
++                    width  = frame.getWidth();
++                    height = frame.getHeight();
++                    dropViewer = false;
++                    unsent.clear();
++                }
++                put16( init, width );
++                put16( init, height );
++                PixelFormat{}.write( init );
++                const juce::String name = "IGNITE";
++                put32( init, (std::uint32_t)name.getNumBytesAsUTF8() );
++                init.insert( init.end(), name.toRawUTF8(), name.toRawUTF8() + name.getNumBytesAsUTF8() );
++                if( !writeAll( Fd, init.data(), init.size() ) )
++                    return ( Why = "write failed" ), false;
++                format = PixelFormat{};
++                return true;
++            }
++
++            void serve( int Fd )
++            {
++                mirrorLog( "viewer connected (" + juce::String( width ) + "x" + juce::String( height ) + ")" );
++                const auto start = juce::Time::getMillisecondCounterHiRes();
++                updates = 0;
++                bytes   = 0;
++                hasViewer = true;
++                if( onViewer )
++                    onViewer();
++                bool        wantUpdate = false;
++                juce::String why       = "viewer closed the connection";
++                while( !threadShouldExit() )
++                {
++                    pollfd fds[3] = { { Fd, POLLIN, 0 }, { wakeFds[0], POLLIN, 0 }, { listenFd, POLLIN, 0 } };
++                    ::poll( fds, 3, 1000 );
++                    if( fds[1].revents != 0 )
++                        drainWake();
++                    if( fds[2].revents & POLLIN )
++                    {
++                        why = "a new viewer replaces it";
++                        break;
++                    }
++                    if( dropViewer )
++                    {
++                        why = "the window was resized";
++                        break;
++                    }
++                    if( fds[0].revents & ( POLLIN | POLLHUP | POLLERR ) )
++                        if( !readMessage( Fd, wantUpdate, why ) )
++                            break;
++                    if( wantUpdate )
++                    {
++                        bool sent = false;
++                        if( !sendUpdate( Fd, sent ) )
++                        {
++                            why = "write failed";
++                            break;
++                        }
++                        wantUpdate = !sent;
++                    }
++                }
++                hasViewer = false;
++                const auto secs = ( juce::Time::getMillisecondCounterHiRes() - start ) / 1000.0;
++                mirrorLog( "viewer gone (" + why + ") after " + juce::String( secs, 1 ) + " s: " + juce::String( updates ) + " updates ("
++                           + juce::String( secs > 0 ? updates / secs : 0.0, 1 ) + "/s), " + juce::String( bytes / 1048576.0, 1 ) + " MB" );
++            }
++
++            bool readMessage( int Fd, bool& WantUpdate, juce::String& Why )
++            {
++                std::uint8_t type = 0, b[20];
++                if( !readAll( Fd, &type, 1 ) )
++                    return false;
++                switch( type )
++                {
++                    case 0: // SetPixelFormat
++                    {
++                        if( !readAll( Fd, b, 19 ) )
++                            return false;
++                        const auto f = PixelFormat::read( b + 3 );
++                        if( f.bitsPerPixel != 32 || !f.trueColour || f.redMax == 0 || f.greenMax == 0 || f.blueMax == 0 )
++                            return ( Why = "unsupported pixel format (only 32-bit true colour)" ), false;
++                        format = f;
++                        return true;
++                    }
++                    case 2: // SetEncodings: raw is always allowed, so they are ignored
++                        return readAll( Fd, b, 3 ) && skip( Fd, (size_t)u16( b + 1 ) * 4 );
++                    case 3: // FramebufferUpdateRequest
++                    {
++                        if( !readAll( Fd, b, 9 ) )
++                            return false;
++                        if( b[0] == 0 ) // not incremental: the whole area asked for
++                        {
++                            std::lock_guard<std::mutex> l( lock );
++                            unsent.add( juce::Rectangle<int>( u16( b + 1 ), u16( b + 3 ), u16( b + 5 ), u16( b + 7 ) ) );
++                        }
++                        WantUpdate = true;
++                        return true;
++                    }
++                    case 4: // KeyEvent: ignored (keys come from the control surface)
++                        return readAll( Fd, b, 7 );
++                    case 5: // PointerEvent
++                    {
++                        if( !readAll( Fd, b, 5 ) )
++                            return false;
++                        if( onPointer )
++                            onPointer( b[0], u16( b + 1 ), u16( b + 3 ) );
++                        return true;
++                    }
++                    case 6: // ClientCutText: skipped
++                    {
++                        if( !readAll( Fd, b, 7 ) )
++                            return false;
++                        const auto n = u32( b + 3 );
++                        return n <= ( 1u << 20 ) && skip( Fd, n );
++                    }
++                    default:
++                        Why = "unknown message type " + juce::String( (int)type );
++                        return false;
++                }
++            }
++
++            /// Sends what changed since the last update, if anything did (Sent).
++            bool sendUpdate( int Fd, bool& Sent )
++            {
++                Sent = false;
++                std::vector<std::uint8_t> out;
++                {
++                    std::lock_guard<std::mutex> l( lock );
++                    if( unsent.isEmpty() || !frame.isValid() )
++                        return true;
++                    unsent.clipTo( frame.getBounds() );
++                    unsent.consolidate();
++                    if( unsent.getNumRectangles() > 16 )
++                    {
++                        const auto all = unsent.getBounds();
++                        unsent.clear();
++                        unsent.add( all );
++                    }
++                    size_t pixels = 0;
++                    for( auto r : unsent )
++                        pixels += (size_t)r.getWidth() * (size_t)r.getHeight();
++                    out.reserve( 4 + unsent.getNumRectangles() * 12 + pixels * 4 );
++                    out.push_back( 0 ); // FramebufferUpdate
++                    out.push_back( 0 );
++                    put16( out, unsent.getNumRectangles() );
++                    const juce::Image::BitmapData data( frame, juce::Image::BitmapData::readOnly );
++                    const bool                    native = format.isNative();
++                    for( auto r : unsent )
++                    {
++                        put16( out, r.getX() );
++                        put16( out, r.getY() );
++                        put16( out, r.getWidth() );
++                        put16( out, r.getHeight() );
++                        put32( out, 0 ); // raw
++                        for( int y = r.getY(); y < r.getBottom(); ++y )
++                        {
++                            const auto* line = data.getPixelPointer( r.getX(), y );
++                            if( native )
++                            {
++                                out.insert( out.end(), line, line + (size_t)r.getWidth() * 4 );
++                                continue;
++                            }
++                            for( int x = 0; x < r.getWidth(); ++x )
++                            {
++                                const auto c = data.getPixelColour( r.getX() + x, y );
++                                const auto v = ( (std::uint32_t)( c.getRed() * format.redMax / 255 ) << format.redShift )
++                                               | ( (std::uint32_t)( c.getGreen() * format.greenMax / 255 ) << format.greenShift )
++                                               | ( (std::uint32_t)( c.getBlue() * format.blueMax / 255 ) << format.blueShift );
++                                for( int i = 0; i < 4; ++i )
++                                    out.push_back( (std::uint8_t)( v >> ( format.bigEndian ? 24 - 8 * i : 8 * i ) ) );
++                            }
++                        }
++                    }
++                    unsent.clear();
++                }
++                Sent = true;
++                ++updates;
++                bytes += (double)out.size();
++                return writeAll( Fd, out.data(), out.size() );
++            }
++
++            const juce::String       path;
++            int                      listenFd{ -1 }, wakeFds[2]{ -1, -1 };
++            ino_t                    socketInode{ 0 };
++            juce::RectangleList<int> unsent; // under lock
++            std::atomic<bool>        dropViewer{ false };
++            PixelFormat              format;
++            int                      width{ 0 }, height{ 0 };
++            int                      updates{ 0 };
++            double                   bytes{ 0 };
++        };
++
++        //==========================================================================================
++        /// The main window's peer when IGNITE_SCREEN_MIRROR is set: no native window. JUCE paints
++        /// into it and dispatches its input as into any peer.
++        class MirrorPeer : public juce::ComponentPeer, private juce::Timer
++        {
++        public:
++            MirrorPeer( juce::Component& Window, int Flags, std::unique_ptr<RfbServer> Server )
++                : juce::ComponentPeer( Window, Flags ), server( std::move( Server ) ), bounds( Window.getBounds() )
++            {
++                resizeFrame();
++                auto onMessageThread = [this]( std::function<void( MirrorPeer& )> F ) {
++                    juce::MessageManager::callAsync( [peer = static_cast<juce::ComponentPeer*>( this ), F]() {
++                        if( juce::ComponentPeer::isValidPeer( peer ) )
++                            if( auto* p = dynamic_cast<MirrorPeer*>( peer ) )
++                                F( *p );
++                    } );
++                };
++                server->onViewer  = [onMessageThread]() { onMessageThread( []( MirrorPeer& P ) { P.repaintAll(); } ); };
++                server->onPointer = [onMessageThread]( int Mask, int X, int Y ) {
++                    onMessageThread( [Mask, X, Y]( MirrorPeer& P ) { P.pointer( Mask, X, Y ); } );
++                };
++            }
++
++            ~MirrorPeer() override
++            {
++                stopTimer();
++                server.reset(); // stops its thread before the peer goes
++            }
++
++            // ComponentPeer: a window with no operating-system window behind it.
++            void*                getNativeHandle() const override { return nullptr; }
++            void                 setVisible( bool ) override {}
++            void                 setTitle( const juce::String& ) override {}
++            void                 setBounds( const juce::Rectangle<int>& NewBounds, bool IsNowFullScreen ) override
++            {
++                bounds     = NewBounds;
++                fullScreen = IsNowFullScreen;
++                resizeFrame();
++            }
++            juce::Rectangle<int> getBounds() const override { return bounds; }
++            juce::Point<float>   localToGlobal( juce::Point<float> P ) override { return P + bounds.getPosition().toFloat(); }
++            juce::Point<float>   globalToLocal( juce::Point<float> P ) override { return P - bounds.getPosition().toFloat(); }
++            using juce::ComponentPeer::globalToLocal;
++            using juce::ComponentPeer::localToGlobal;
++            void               setMinimised( bool ) override {}
++            bool               isMinimised() const override { return false; }
++            void               setFullScreen( bool F ) override { fullScreen = F; }
++            bool               isFullScreen() const override { return fullScreen; }
++            void               setIcon( const juce::Image& ) override {}
++            bool               contains( juce::Point<int> P, bool ) const override { return bounds.withZeroOrigin().contains( P ); }
++            OptionalBorderSize getFrameSizeIfPresent() const override { return OptionalBorderSize( juce::BorderSize<int>() ); }
++            juce::BorderSize<int> getFrameSize() const override { return {}; }
++            bool                  setAlwaysOnTop( bool ) override { return true; }
++            void                  toFront( bool ) override {}
++            void                  toBehind( juce::ComponentPeer* ) override {}
++            bool                  isFocused() const override { return true; } // the only window there is
++            void                  grabFocus() override {}
++            void                  textInputRequired( juce::Point<int>, juce::TextInputTarget& ) override {}
++            void                  setAlpha( float ) override {}
++            juce::StringArray     getAvailableRenderingEngines() override { return { "Software Renderer" }; }
++
++            void repaint( const juce::Rectangle<int>& Area ) override
++            {
++                if( !server->hasViewer )
++                    return; // nobody looks: nothing to paint (a viewer gets a full frame first)
++                dirty.add( Area.getIntersection( bounds.withZeroOrigin() ) );
++                schedule();
++            }
++
++            void performAnyPendingRepaintsNow() override
++            {
++                if( server->hasViewer )
++                    paintNow();
++            }
++
++        private:
++            void repaintAll()
++            {
++                dirty.add( bounds.withZeroOrigin() );
++                schedule();
++            }
++
++            void schedule()
++            {
++                if( isTimerRunning() || dirty.isEmpty() )
++                    return;
++                const auto since = juce::Time::getMillisecondCounterHiRes() - lastPaint;
++                startTimer( juce::jmax( 1, 1000 / maxFramesPerSecond - (int)since ) );
++            }
++
++            void timerCallback() override
++            {
++                stopTimer();
++                paintNow();
++            }
++
++            void paintNow()
++            {
++                if( dirty.isEmpty() )
++                    return;
++                lastPaint = juce::Time::getMillisecondCounterHiRes();
++                juce::RectangleList<int> areas;
++                areas.swapWith( dirty );
++                {
++                    std::lock_guard<std::mutex> l( server->lock );
++                    if( !server->frame.isValid() )
++                        return;
++                    areas.clipTo( server->frame.getBounds() );
++                    areas.consolidate();
++                    if( areas.isEmpty() )
++                        return;
++                    juce::LowLevelGraphicsSoftwareRenderer context( server->frame );
++                    context.clipToRectangleList( areas );
++                    context.setFill( juce::Colours::black );
++                    context.fillRect( server->frame.getBounds(), true );
++                    handlePaint( context );
++                }
++                server->framePainted( areas );
++            }
++
++            void resizeFrame()
++            {
++                std::lock_guard<std::mutex> l( server->lock );
++                const auto size = bounds.getWidth() > 0 && bounds.getHeight() > 0 ? bounds.withZeroOrigin() : juce::Rectangle<int>();
++                if( server->frame.isValid() ? server->frame.getBounds() == size : size.isEmpty() )
++                    return;
++                server->frame = size.isEmpty() ? juce::Image() : juce::Image( juce::Image::ARGB, size.getWidth(), size.getHeight(), true, juce::SoftwareImageType() );
++                server->frameResized();
++            }
++
++            void pointer( int Mask, int X, int Y )
++            {
++                // Button 1 is the finger: down, moves while down (drags), up. As a native window's
++                // events do, update the modifier state first, then hand the event to the peer.
++                const bool down = ( Mask & 1 ) != 0;
++                if( !down && !wasDown )
++                    return; // hover: a touch panel has none (viewers send it as the mouse moves)
++                auto       mods = juce::ModifierKeys::currentModifiers.withoutMouseButtons();
++                if( down )
++                    mods = mods.withFlags( juce::ModifierKeys::leftButtonModifier );
++                juce::ModifierKeys::currentModifiers = mods;
++                const juce::Point<float> pos( (float)X, (float)Y );
++                if( down != wasDown )
++                {
++                    auto* c = getComponent().getComponentAt( pos.roundToInt() );
++                    mirrorLog( juce::String( down ? "touch down " : "touch up " ) + juce::String( X ) + " " + juce::String( Y )
++                               + ( c != nullptr ? " on " + describe( *c ) : juce::String() ) );
++                }
++                wasDown = down;
++                // The main mouse source, as on the unit (JUCE makes touch sources only where the
++                // platform reports touch input).
++                handleMouseEvent( juce::MouseInputSource::InputSourceType::mouse, pos, mods,
++                                  down ? 1.0f : juce::MouseInputSource::defaultPressure, juce::MouseInputSource::defaultOrientation,
++                                  juce::Time::currentTimeMillis() );
++            }
++
++            std::unique_ptr<RfbServer> server;
++            juce::Rectangle<int>       bounds;
++            bool                       fullScreen{ false }, wasDown{ false };
++            juce::RectangleList<int>   dirty;
++            double                     lastPaint{ 0 };
++        };
++    } // namespace
++
++    bool ScreenMirror::requested()
++    {
++        static const bool r = juce::SystemStats::getEnvironmentVariable( "IGNITE_SCREEN_MIRROR", {} ).trim().isNotEmpty();
++        return r;
++    }
++
++    juce::ComponentPeer* ScreenMirror::createPeer( juce::Component& Window, int StyleFlags )
++    {
++        if( !requested() )
++            return nullptr;
++        const auto path   = juce::File::getCurrentWorkingDirectory().getChildFile( juce::SystemStats::getEnvironmentVariable( "IGNITE_SCREEN_MIRROR", {} ).trim() ).getFullPathName();
++        auto       server = std::make_unique<RfbServer>( path );
++        juce::String error;
++        if( !server->open( error ) )
++        {
++            mirrorLog( "cannot serve the screen on " + path + ": " + error + "; using a normal window" );
++            return nullptr;
++        }
++    #if JUCE_MAC
++        juce::Process::setDockIconVisible( false ); // nothing of the app on the desktop
++    #endif
++        mirrorLog( "serving the screen on " + path + " (RFB 3.8, raw, no authentication, at most " + juce::String( maxFramesPerSecond )
++                   + " frames/s); the window has no native window" );
++        return new MirrorPeer( Window, StyleFlags, std::move( server ) );
++    }
++
++    bool ScreenMirror::isMirrored( const juce::Component& C )
++    {
++        return dynamic_cast<MirrorPeer*>( C.getPeer() ) != nullptr;
++    }
++} // namespace testcontrol
++
++#endif
+diff --git a/Source/Application/apps/ignite/ScreenMirror.h b/Source/Application/apps/ignite/ScreenMirror.h
+new file mode 100644
+index 00000000..beaa4a66
+--- /dev/null
++++ b/Source/Application/apps/ignite/ScreenMirror.h
+@@ -0,0 +1,66 @@
++/*
++ * Copyright (c) 2024 MUSIC Tribe
++ *
++ * This file is part of Kick.
++ *
++ * Kick is free software: you can redistribute it and/or modify it under the
++ * terms of the GNU Affero General Public License as published by the Free
++ * Software Foundation, either version 3 of the License, or (at your option)
++ * any later version.
++ *
++ * Kick is distributed in the hope that it will be useful, but WITHOUT ANY
++ * WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS
++ * FOR A PARTICULAR PURPOSE. See the GNU Affero General Public License for
++ * more details.
++ *
++ * You should have received a copy of the GNU Affero General Public License
++ * along with Kick. If not, see <https://www.gnu.org/licenses/>.
++ *
++ * SPDX-License-Identifier: AGPL-3.0-or-later
++ */
++
++#pragma once
++// Taken from the KICK firmware (KickEm-Tools/0700-AAM, Kick/modules/test_control) for the IGNITE emulator:
++// the variable is IGNITE_SCREEN_MIRROR here.
++#include <JuceHeader.h>
++
++namespace testcontrol
++{
++    /// An opt-in way to show and touch the app's screen from another program, for an emulator or
++    /// a remote check: IGNITE_SCREEN_MIRROR=<unix socket path>.
++    ///
++    /// Without the variable nothing is created and the window is the usual native one (on the unit:
++    /// the whole display). With it, the main window gets no native window at all. Its peer is a
++    /// headless one (createPeer) that
++    ///
++    /// - renders the window, everything on it included (popups, the spinner, bubbles: they are its
++    ///   children, ui::overlayRoot()), with JUCE's software renderer, the renderer the unit uses,
++    ///   when JUCE asks it to repaint, at most 30 times a second and only while a viewer is
++    ///   connected;
++    /// - serves the result on <unix socket path> as an RFB 3.8 ("VNC") server: no authentication,
++    ///   raw encoding, only the areas that changed, one viewer at a time (a new one replaces the
++    ///   old). The socket is created with mode 0600, never on a network;
++    /// - turns the viewer's pointer into touches: button 1 down, moves while it is down, button 1
++    ///   up go to the peer's handleMouseEvent, as a native window's events do (moves with no button
++    ///   held are ignored: a touch panel has no hover), so JUCE dispatches
++    ///   them to the component under the point, its mouse listeners and its parents' (list rows,
++    ///   drags, sliders) exactly as a finger on the unit's screen.
++    ///
++    /// Because nothing depends on the operating system's windows, this works with the computer's
++    /// screen locked, and nothing of the app appears on the desktop (on macOS its Dock icon is
++    /// hidden too). Keyboard events from the viewer are ignored: keys are the control surface's
++    /// job and arrive over the serial port. Log lines start with "ScreenMirror: ".
++    struct ScreenMirror
++    {
++        /// True when IGNITE_SCREEN_MIRROR is set (read once).
++        static bool requested();
++
++        /// A headless peer serving Window, if requested() (call from Window's createNewPeer).
++        /// Null otherwise, or if the socket cannot be created (logged; the caller then makes the
++        /// usual native peer).
++        static juce::ComponentPeer* createPeer( juce::Component& Window, int StyleFlags );
++
++        /// True if C is on a ScreenMirror peer (it has no native window and no display to fill).
++        static bool isMirrored( const juce::Component& C );
++    };
++} // namespace testcontrol
