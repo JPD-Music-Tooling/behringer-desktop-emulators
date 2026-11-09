@@ -4,10 +4,15 @@
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
+
+#ifdef _WIN32
+#include <windows.h>
+#else
 #include <fcntl.h>
 #include <poll.h>
 #include <termios.h>
 #include <unistd.h>
+#endif
 
 namespace ignitem {
 
@@ -23,6 +28,7 @@ std::string hex(const std::vector<uint8_t>& b, size_t max = 24) {
     if (b.size() > max) s += "...";
     return s;
 }
+#ifndef _WIN32
 void makeRaw(int fd) {
     termios t{};
     if (tcgetattr(fd, &t) != 0) return;
@@ -31,6 +37,7 @@ void makeRaw(int fd) {
     t.c_cc[VTIME] = 0;
     tcsetattr(fd, TCSANOW, &t);
 }
+#endif
 }  // namespace
 
 Link::Link(std::function<void(const std::string&)> log) : log_(std::move(log)) {}
@@ -39,11 +46,25 @@ Link::~Link() {
     running_ = false;
     if (reader_.joinable()) reader_.join();
     if (ticker_.joinable()) ticker_.join();
+#ifdef _WIN32
+    if (master_) ::CloseHandle(static_cast<HANDLE>(master_));
+#else
     if (slaveFd_ >= 0) ::close(slaveFd_);
     if (master_ >= 0) ::close(master_);
+#endif
 }
 
 bool Link::open() {
+#ifdef _WIN32
+    // Named pipe, server side: the app (Ignite's FrontPannelManager, FP_UART_WIN_PANEL) connects as a
+    // client via CreateFile on the same name -- the same "panel is the side that creates the link, the
+    // app opens it" shape as the macOS pty, just with Win32 primitives instead of posix_openpt.
+    slave_ = R"(\\.\pipe\IgnitePanel)";
+    HANDLE h = ::CreateNamedPipeA(slave_.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
+                                   1, 4096, 4096, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return log_("IgnitePanel: pipe failed"), false;
+    master_ = h;
+#else
     master_ = posix_openpt(O_RDWR | O_NOCTTY);
     if (master_ < 0 || grantpt(master_) != 0 || unlockpt(master_) != 0) return log_("IgnitePanel: pty failed"), false;
     const char* name = ptsname(master_);
@@ -54,6 +75,7 @@ bool Link::open() {
     slaveFd_ = ::open(slave_.c_str(), O_RDWR | O_NOCTTY);
     makeRaw(slaveFd_);
     makeRaw(master_);
+#endif
     running_ = true;
     reader_ = std::thread([this] { readLoop(); });
     ticker_ = std::thread([this] { tickLoop(); });
@@ -63,12 +85,23 @@ bool Link::open() {
 
 void Link::write(const std::vector<uint8_t>& bytes) {
     std::lock_guard<std::mutex> lk(writeMu_);
+#ifdef _WIN32
+    DWORD off = 0;
+    while (off < bytes.size()) {
+        DWORD n = 0;
+        if (!::WriteFile(static_cast<HANDLE>(master_), bytes.data() + off, DWORD(bytes.size()) - off, &n, nullptr) ||
+            n == 0)
+            return;
+        off += n;
+    }
+#else
     size_t off = 0;
     while (off < bytes.size()) {
         const ssize_t n = ::write(master_, bytes.data() + off, bytes.size() - off);
         if (n <= 0) return;
         off += size_t(n);
     }
+#endif
     std::lock_guard<std::mutex> l2(mu_);
     ++counters_.framesOut;
 }
@@ -158,6 +191,43 @@ void Link::tickLoop() {
 
 // ---- what the app sends
 
+void Link::drainFrames() {
+    while (rx_.size() >= 4) {
+        if (rx_[0] < 0xE0 || rx_[0] > 0xE8 || rx_[1] != 0x02) {  // not a packet start: resync
+            rx_.erase(rx_.begin());
+            continue;
+        }
+        const size_t size = rx_[3];
+        if (size < 4) {
+            rx_.erase(rx_.begin());
+            continue;
+        }
+        if (rx_.size() < size) break;
+        std::vector<uint8_t> f(rx_.begin(), rx_.begin() + long(size));
+        rx_.erase(rx_.begin(), rx_.begin() + long(size));
+        handle(f);
+    }
+}
+
+#ifdef _WIN32
+void Link::readLoop() {
+    uint8_t buf[1024];
+    HANDLE h = static_cast<HANDLE>(master_);
+    while (running_) {
+        if (!::ConnectNamedPipe(h, nullptr) && ::GetLastError() != ERROR_PIPE_CONNECTED) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            continue;
+        }
+        while (running_) {
+            DWORD n = 0;
+            if (!::ReadFile(h, buf, sizeof buf, &n, nullptr) || n == 0) break;  // app closed: wait for a reconnect
+            rx_.insert(rx_.end(), buf, buf + n);
+            drainFrames();
+        }
+        ::DisconnectNamedPipe(h);
+    }
+}
+#else
 void Link::readLoop() {
     uint8_t buf[1024];
     while (running_) {
@@ -166,23 +236,10 @@ void Link::readLoop() {
         const ssize_t n = ::read(master_, buf, sizeof buf);
         if (n <= 0) continue;
         rx_.insert(rx_.end(), buf, buf + n);
-        while (rx_.size() >= 4) {
-            if (rx_[0] < 0xE0 || rx_[0] > 0xE8 || rx_[1] != 0x02) {  // not a packet start: resync
-                rx_.erase(rx_.begin());
-                continue;
-            }
-            const size_t size = rx_[3];
-            if (size < 4) {
-                rx_.erase(rx_.begin());
-                continue;
-            }
-            if (rx_.size() < size) break;
-            std::vector<uint8_t> f(rx_.begin(), rx_.begin() + long(size));
-            rx_.erase(rx_.begin(), rx_.begin() + long(size));
-            handle(f);
-        }
+        drainFrames();
     }
 }
+#endif
 
 void Link::handle(const std::vector<uint8_t>& f) {
     const uint8_t h = f[0], id = f[2];

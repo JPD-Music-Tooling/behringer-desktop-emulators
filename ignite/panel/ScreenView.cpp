@@ -7,6 +7,7 @@
 #include <cstring>
 #include <vector>
 
+#ifndef _WIN32
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
@@ -14,6 +15,7 @@
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <unistd.h>
+#endif
 
 namespace sim
 {
@@ -23,6 +25,20 @@ namespace sim
 
         double nowMs() { return juce::Time::getMillisecondCounterHiRes(); }
 
+        std::uint16_t u16( const std::uint8_t* P ) { return (std::uint16_t)( ( P[0] << 8 ) | P[1] ); }
+        std::uint32_t u32( const std::uint8_t* P ) { return ( (std::uint32_t)P[0] << 24 ) | ( (std::uint32_t)P[1] << 16 ) | ( (std::uint32_t)P[2] << 8 ) | P[3]; }
+        void          put16( std::vector<std::uint8_t>& B, int V )
+        {
+            B.push_back( (std::uint8_t)( V >> 8 ) );
+            B.push_back( (std::uint8_t)V );
+        }
+        void put32( std::vector<std::uint8_t>& B, std::uint32_t V )
+        {
+            for( int s = 24; s >= 0; s -= 8 )
+                B.push_back( (std::uint8_t)( V >> s ) );
+        }
+
+#ifndef _WIN32
         bool readAll( int Fd, void* Data, size_t Size )
         {
             auto* p = static_cast<std::uint8_t*>( Data );
@@ -53,19 +69,6 @@ namespace sim
                 Size -= n;
             }
             return true;
-        }
-
-        std::uint16_t u16( const std::uint8_t* P ) { return (std::uint16_t)( ( P[0] << 8 ) | P[1] ); }
-        std::uint32_t u32( const std::uint8_t* P ) { return ( (std::uint32_t)P[0] << 24 ) | ( (std::uint32_t)P[1] << 16 ) | ( (std::uint32_t)P[2] << 8 ) | P[3]; }
-        void          put16( std::vector<std::uint8_t>& B, int V )
-        {
-            B.push_back( (std::uint8_t)( V >> 8 ) );
-            B.push_back( (std::uint8_t)V );
-        }
-        void put32( std::vector<std::uint8_t>& B, std::uint32_t V )
-        {
-            for( int s = 24; s >= 0; s -= 8 )
-                B.push_back( (std::uint8_t)( V >> s ) );
         }
 
         /// Connects to "unix:<path>", a bare path, or "tcp:<host>:<port>"; -1 on failure.
@@ -110,6 +113,7 @@ namespace sim
             }
             return fd;
         }
+#endif // !_WIN32
     } // namespace
 
     ScreenView::ScreenView( const juce::String& Source )
@@ -124,8 +128,10 @@ namespace sim
     ScreenView::~ScreenView()
     {
         signalThreadShouldExit();
+#ifndef _WIN32
         if( const int f = fd.load(); f >= 0 )
             ::shutdown( f, SHUT_RDWR );
+#endif
         stopThread( 3000 );
         cancelPendingUpdate();
     }
@@ -289,6 +295,10 @@ namespace sim
 
     bool ScreenView::send( const void* Data, size_t Size )
     {
+#ifdef _WIN32
+        (void)Data; (void)Size;
+        return false;  // Windows: screen-mirror transport not yet ported (ADO #456); run() never connects
+#else
         std::lock_guard<std::mutex> l( writeLock );
         const int f = fd;
         if( f < 0 )
@@ -313,8 +323,17 @@ namespace sim
                 return false;
         }
         return true;
+#endif
     }
 
+#ifdef _WIN32
+    void ScreenView::run()
+    {
+        // Windows: the screen-mirror transport (named pipe or TCP loopback) isn't ported yet (ADO
+        // #456) -- the view shows its "waiting" placeholder (setStatusText/paint) indefinitely.
+    }
+    bool ScreenView::session( int, juce::String& Why ) { return ( Why = "not supported on Windows yet" ), false; }
+#else
     void ScreenView::run()
     {
         juce::String lastWhy;
@@ -541,4 +560,5 @@ namespace sim
         Why = "stopping";
         return true;
     }
+#endif // _WIN32
 } // namespace sim

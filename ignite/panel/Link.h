@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// The front panel microcontroller's side of the IGNITE link, over a pty.
+// The front panel microcontroller's side of the IGNITE link, over a pty (macOS/Linux) or a named pipe
+// (Windows).
 //
 // Wire format (FrontPannelManager.cpp, MCUInterfaceParams.h): every packet is
 //   [header E0..E8][direction][id][size][payload]
@@ -31,7 +32,7 @@ class Link {
 public:
     explicit Link(std::function<void(const std::string&)> log);
     ~Link();
-    bool open();                       // makes the pty; slavePath() is what the app opens
+    bool open();                       // makes the link; slavePath() is what the app opens/connects to
     const std::string& slavePath() const { return slave_; }
     bool live() const { return live_; }
 
@@ -51,11 +52,16 @@ private:
     void readLoop();
     void tickLoop();
     void handle(const std::vector<uint8_t>& f);
+    void drainFrames();                // consumes complete frames out of rx_, dispatching each to handle()
     void write(const std::vector<uint8_t>& bytes);
     void sendKeys();
 
     std::function<void(const std::string&)> log_;
+#ifdef _WIN32
+    void* master_ = nullptr;           // HANDLE to the named pipe (kept as void* so windows.h stays out of callers)
+#else
     int master_ = -1, slaveFd_ = -1;
+#endif
     std::string slave_;
     std::atomic<bool> running_{false}, live_{false}, synced_{false};
     std::thread reader_, ticker_;
