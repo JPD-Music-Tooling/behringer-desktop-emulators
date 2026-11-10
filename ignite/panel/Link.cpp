@@ -23,12 +23,16 @@ namespace {
 // concurrent reader thread and writer thread on one handle hung the same way readLoop()/tickLoop()
 // did here; switching both to overlapped I/O with a per-call OVERLAPPED/event fixed it). Every
 // Windows read/write on this link goes through these two helpers instead of the bare WinAPI calls.
+// lpNumberOfBytesRead/-Written is unreliable on an overlapped handle even when the call completes
+// synchronously (TRUE immediately) -- the actually-transferred count must always come from
+// GetOverlappedResult. Assuming it equals the requested size (an earlier version of this code did)
+// causes a short completion to report phantom bytes from whatever was left in the caller's buffer,
+// which looks exactly like a flood of repeated/garbled frames once the real traffic is short reads.
 bool overlappedWrite(HANDLE h, const void* data, DWORD size, DWORD& written) {
     OVERLAPPED ov{};
     ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     BOOL ok = ::WriteFile(h, data, size, nullptr, &ov);
-    if (!ok && ::GetLastError() == ERROR_IO_PENDING) ok = ::GetOverlappedResult(h, &ov, &written, TRUE);
-    else if (ok) written = size;
+    if (ok || ::GetLastError() == ERROR_IO_PENDING) ok = ::GetOverlappedResult(h, &ov, &written, TRUE);
     ::CloseHandle(ov.hEvent);
     return ok != 0;
 }
@@ -36,8 +40,7 @@ bool overlappedRead(HANDLE h, void* buf, DWORD size, DWORD& read) {
     OVERLAPPED ov{};
     ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
     BOOL ok = ::ReadFile(h, buf, size, nullptr, &ov);
-    if (!ok && ::GetLastError() == ERROR_IO_PENDING) ok = ::GetOverlappedResult(h, &ov, &read, TRUE);
-    else if (ok) read = size;
+    if (ok || ::GetLastError() == ERROR_IO_PENDING) ok = ::GetOverlappedResult(h, &ov, &read, TRUE);
     ::CloseHandle(ov.hEvent);
     return ok != 0;
 }
