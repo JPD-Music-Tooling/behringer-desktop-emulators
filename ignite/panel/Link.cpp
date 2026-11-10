@@ -17,6 +17,31 @@
 namespace ignitem {
 
 namespace {
+#ifdef _WIN32
+// Synchronous ReadFile/WriteFile from two different threads on the same pipe handle can hang
+// indefinitely while the other direction is pending (observed directly: a minimal repro with a
+// concurrent reader thread and writer thread on one handle hung the same way readLoop()/tickLoop()
+// did here; switching both to overlapped I/O with a per-call OVERLAPPED/event fixed it). Every
+// Windows read/write on this link goes through these two helpers instead of the bare WinAPI calls.
+bool overlappedWrite(HANDLE h, const void* data, DWORD size, DWORD& written) {
+    OVERLAPPED ov{};
+    ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    BOOL ok = ::WriteFile(h, data, size, nullptr, &ov);
+    if (!ok && ::GetLastError() == ERROR_IO_PENDING) ok = ::GetOverlappedResult(h, &ov, &written, TRUE);
+    else if (ok) written = size;
+    ::CloseHandle(ov.hEvent);
+    return ok != 0;
+}
+bool overlappedRead(HANDLE h, void* buf, DWORD size, DWORD& read) {
+    OVERLAPPED ov{};
+    ov.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+    BOOL ok = ::ReadFile(h, buf, size, nullptr, &ov);
+    if (!ok && ::GetLastError() == ERROR_IO_PENDING) ok = ::GetOverlappedResult(h, &ov, &read, TRUE);
+    else if (ok) read = size;
+    ::CloseHandle(ov.hEvent);
+    return ok != 0;
+}
+#endif
 double nowMs() {
     using namespace std::chrono;
     return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
@@ -60,9 +85,9 @@ bool Link::open() {
     // client via CreateFile on the same name -- the same "panel is the side that creates the link, the
     // app opens it" shape as the macOS pty, just with Win32 primitives instead of posix_openpt.
     slave_ = R"(\\.\pipe\IgnitePanel)";
-    HANDLE h = ::CreateNamedPipeA(slave_.c_str(), PIPE_ACCESS_DUPLEX, PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT,
-                                   1, 4096, 4096, 0, nullptr);
-    if (h == INVALID_HANDLE_VALUE) return log_("IgnitePanel: pipe failed"), false;
+    HANDLE h = ::CreateNamedPipeA(slave_.c_str(), PIPE_ACCESS_DUPLEX | FILE_FLAG_OVERLAPPED,
+                                   PIPE_TYPE_BYTE | PIPE_READMODE_BYTE | PIPE_WAIT, 1, 4096, 4096, 0, nullptr);
+    if (h == INVALID_HANDLE_VALUE) return log_("IgnitePanel: pipe failed, GetLastError=" + std::to_string(::GetLastError())), false;
     master_ = h;
 #else
     master_ = posix_openpt(O_RDWR | O_NOCTTY);
@@ -89,9 +114,11 @@ void Link::write(const std::vector<uint8_t>& bytes) {
     DWORD off = 0;
     while (off < bytes.size()) {
         DWORD n = 0;
-        if (!::WriteFile(static_cast<HANDLE>(master_), bytes.data() + off, DWORD(bytes.size()) - off, &n, nullptr) ||
-            n == 0)
+        if (!overlappedWrite(static_cast<HANDLE>(master_), bytes.data() + off, DWORD(bytes.size()) - off, n) ||
+            n == 0) {
+            log_("IgnitePanel: WriteFile failed, GetLastError=" + std::to_string(::GetLastError()));
             return;
+        }
         off += n;
     }
 #else
@@ -214,13 +241,32 @@ void Link::readLoop() {
     uint8_t buf[1024];
     HANDLE h = static_cast<HANDLE>(master_);
     while (running_) {
-        if (!::ConnectNamedPipe(h, nullptr) && ::GetLastError() != ERROR_PIPE_CONNECTED) {
+        OVERLAPPED connOv{};
+        connOv.hEvent = ::CreateEventW(nullptr, TRUE, FALSE, nullptr);
+        BOOL ok = ::ConnectNamedPipe(h, &connOv);
+        const DWORD err = ::GetLastError();
+        if (!ok && err == ERROR_IO_PENDING) {
+            // Block until an actual client connects (or shutdown cancels it) -- never abandon this
+            // pending I/O on a timeout: that desyncs the pipe's real connection state from what we
+            // think it is (seen directly: spurious ERROR_PIPE_LISTENING on later writes).
+            DWORD ignored = 0;
+            ok = ::GetOverlappedResult(h, &connOv, &ignored, TRUE);
+        } else if (!ok && err == ERROR_PIPE_CONNECTED) {
+            ok = TRUE;
+        }
+        ::CloseHandle(connOv.hEvent);
+        if (!ok || !running_) {
+            if (!running_) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
             continue;
         }
+        log_("IgnitePanel: client connected");
         while (running_) {
             DWORD n = 0;
-            if (!::ReadFile(h, buf, sizeof buf, &n, nullptr) || n == 0) break;  // app closed: wait for a reconnect
+            if (!overlappedRead(h, buf, sizeof buf, n) || n == 0) {
+                log_("IgnitePanel: ReadFile ended, GetLastError=" + std::to_string(::GetLastError()));
+                break;  // app closed: wait for a reconnect
+            }
             rx_.insert(rx_.end(), buf, buf + n);
             drainFrames();
         }
